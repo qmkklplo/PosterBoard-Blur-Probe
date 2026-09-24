@@ -1,0 +1,545 @@
+name: Build GoldenNugget PosterBoard Blur Probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout GoldenNugget source
+        uses: actions/checkout@v4
+        with:
+          repository: awesomenull-dev/GoldenNugget
+          submodules: recursive
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install probe dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install pymobiledevice3==10.7.1 pyinstaller==6.22.1
+
+      - name: Apply Windows pairing compatibility patch
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import re
+          import pymobiledevice3
+
+          lockdown = Path(pymobiledevice3.__file__).resolve().parent / "lockdown.py"
+          text = lockdown.read_text(encoding="utf-8")
+
+          marker = "BlurProbe: usbmux SavePairRecord returned result 183"
+          if marker in text:
+              print("Pairing compatibility patch already present")
+              raise SystemExit(0)
+
+          save_re = re.compile(
+              r'(?m)^([ \t]*)await\s+client\.save_pair_record\(\s*self\.identifier\s*,\s*self\.service\.mux_device\.devid\s*,\s*record_data\s*\)\s*$'
+          )
+
+          def repl(m):
+              i = m.group(1)
+              return (
+                  f"{i}try:\n"
+                  f"{i}    await client.save_pair_record(self.identifier, self.service.mux_device.devid, record_data)\n"
+                  f"{i}except Exception as e:\n"
+                  f"{i}    _s = str(e)\n"
+                  f"{i}    if ((type(e).__name__ == 'MuxException' and (\"Number': 183\" in _s or '\"Number\": 183' in _s))\n"
+                  f"{i}            or getattr(e, 'winerror', None) == 183):\n"
+                  f"{i}        self.logger.warning('BlurProbe: usbmux SavePairRecord returned result 183; local pair record already exists, continuing')\n"
+                  f"{i}    else:\n"
+                  f"{i}        raise"
+              )
+
+          text2, n = save_re.subn(repl, text, count=1)
+          if n == 1:
+              lockdown.write_text(text2, encoding="utf-8")
+              print("Applied Windows pairing compatibility patch:", lockdown)
+          else:
+              # Do not silently rewrite an unknown pymobiledevice3 layout.
+              print("WARNING: SavePairRecord line was not found; continuing without the optional WinError/Mux 183 patch.")
+          '@ | Set-Content -Encoding UTF8 patch_pairing.py
+          python patch_pairing.py
+
+      - name: Create read-only Blur Probe
+        shell: pwsh
+        run: |
+          @'
+          # GoldenNugget PosterBoard Blur Probe
+          # Read-only: performs MobileBackup2 backups only. It never restores or writes to the phone.
+
+          import argparse
+          import asyncio
+          import csv
+          import hashlib
+          import json
+          import os
+          import re
+          import shutil
+          import sqlite3
+          import sys
+          import tempfile
+          import time
+          import zipfile
+          from contextlib import asynccontextmanager
+          from datetime import datetime
+          from pathlib import Path
+
+          from pymobiledevice3 import usbmux
+          from pymobiledevice3.exceptions import NotPairedError
+          from pymobiledevice3.lockdown import create_using_usbmux
+          from pymobiledevice3.services.mobilebackup2 import Mobilebackup2Service
+
+
+          PB_DOMAIN = "AppDomain-com.apple.PosterBoard"
+          PB_DB_NAME = "PBFPosterExtensionDataStoreSQLiteDatabase.sqlite3"
+          PB_STORE_MARKER = "Library/Application Support/PRBPosterExtensionDataStore/"
+          KEYWORDS = (
+              "posterboard", "wallpaper", "mercury", "homescreen",
+              "home screen", "springboard", "celosia", "blur",
+              "prbposter", "posterkit",
+          )
+
+
+          @asynccontextmanager
+          async def lockdown_session(serial=None):
+              ld = await create_using_usbmux(serial=serial, autopair=True, pair_timeout=120.0)
+              try:
+                  if not getattr(ld, "paired", False):
+                      raise NotPairedError("device did not confirm trust")
+                  yield ld
+              finally:
+                  try:
+                      await ld.close()
+                  except Exception:
+                      pass
+
+
+          def norm(s: str) -> str:
+              return (s or "").replace("\\", "/").lstrip("/")
+
+
+          def physical_tree_name(s: str) -> str:
+              """Mirror GoldenNugget's iOS 27 /.b/<n>/ physical-tree normalization."""
+              name = norm(s)
+              parts = name.split("/")
+              if len(parts) >= 3 and parts[0] in (".b", "b") and parts[1].isdigit():
+                  return "/".join(parts[2:])
+              return name
+
+
+          def safe_component(s: str) -> str:
+              s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", s or "_")
+              s = s.rstrip(" .")
+              return s or "_"
+
+
+          def safe_rel_path(rel: str) -> Path:
+              parts = [safe_component(p) for p in norm(rel).split("/") if p not in ("", ".", "..")]
+              return Path(*parts) if parts else Path("_")
+
+
+          def sha256_file(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+
+          def find_device_dir(root: Path) -> Path:
+              direct = root / "Manifest.db"
+              if direct.is_file():
+                  return root
+              for p in root.iterdir():
+                  if p.is_dir() and (p / "Manifest.db").is_file():
+                      return p
+              raise RuntimeError(f"Manifest.db not found under {root}")
+
+
+          def find_pb_identity(manifest_db: Path):
+              if not manifest_db.is_file():
+                  raise RuntimeError("Manifest.db is missing")
+              conn = sqlite3.connect(str(manifest_db))
+              try:
+                  rows = conn.execute(
+                      "SELECT fileID, domain, relativePath, flags FROM Files "
+                      "WHERE relativePath LIKE ? OR domain = ? "
+                      "ORDER BY relativePath",
+                      (f"%{PB_DB_NAME}%", PB_DOMAIN),
+                  ).fetchall()
+              finally:
+                  conn.close()
+
+              db_rows = [r for r in rows if PB_DB_NAME in (r[2] or "")]
+              if not db_rows:
+                  raise RuntimeError("PosterBoard database row was not found in Manifest.db")
+
+              # Prefer the main DB over -wal / -shm.
+              db_rows.sort(key=lambda r: (not (r[2] or "").endswith(PB_DB_NAME), len(r[2] or "")))
+              file_id, domain, rel_path, _flags = db_rows[0]
+              rel_path = norm(rel_path)
+              tree_rel = physical_tree_name(rel_path)
+
+              if domain == PB_DOMAIN and not tree_rel.startswith("Containers/"):
+                  return {
+                      "mode": "domain",
+                      "domain": PB_DOMAIN,
+                      "root": PB_DOMAIN,
+                      "db_relative_path": rel_path,
+                      "db_file_id": file_id,
+                  }
+
+              marker = "/" + PB_STORE_MARKER
+              probe = "/" + tree_rel
+              idx = probe.lower().find(marker.lower())
+              if idx >= 0:
+                  root = probe[1:idx]
+              else:
+                  # Generic fallback: cut before /Library/ if present.
+                  lower = probe.lower()
+                  lib_idx = lower.find("/library/")
+                  if lib_idx >= 0:
+                      root = probe[1:lib_idx]
+                  else:
+                      # Last-resort root: parent of the PRB store marker or DB.
+                      root = str(Path(tree_rel).parent)
+
+              if not root:
+                  raise RuntimeError(f"Could not derive PosterBoard physical container root from: {rel_path}")
+
+              return {
+                  "mode": "physical",
+                  "domain": domain or "",
+                  "root": norm(root),
+                  "db_relative_path": rel_path,
+                  "db_file_id": file_id,
+              }
+
+
+          def is_aux_candidate(device_name: str) -> bool:
+              n = physical_tree_name(device_name)
+              low = n.lower()
+              if PB_DB_NAME.lower() in low:
+                  return True
+              # Keep only small, wallpaper-relevant preference / SpringBoard paths outside the container.
+              in_preferences = ("library/preferences/" in low or low.startswith("library/preferences/"))
+              in_springboard = ("library/springboard/" in low or low.startswith("library/springboard/"))
+              if (in_preferences or in_springboard) and any(k in low for k in KEYWORDS):
+                  return True
+              return False
+
+
+          def keyword_hit(domain: str, rel_path: str) -> bool:
+              low = f"{domain}/{rel_path}".lower()
+              return any(k in low for k in KEYWORDS)
+
+
+          def locate_payload(device_dir: Path, file_id: str) -> Path | None:
+              if not file_id:
+                  return None
+              candidates = [device_dir / file_id[:2] / file_id, device_dir / file_id]
+              for p in candidates:
+                  if p.is_file():
+                      return p
+              return None
+
+
+          def materialize_capture(device_dir: Path, out_dir: Path, identity: dict, label: str):
+              manifest = device_dir / "Manifest.db"
+              conn = sqlite3.connect(str(manifest))
+              try:
+                  rows = conn.execute(
+                      "SELECT fileID, domain, relativePath, flags FROM Files ORDER BY domain, relativePath"
+                  ).fetchall()
+              finally:
+                  conn.close()
+
+              logical = out_dir / "logical"
+              logical.mkdir(parents=True, exist_ok=True)
+              kept_rows = []
+              keyword_rows = []
+
+              for file_id, domain, rel_path, flags in rows:
+                  domain = domain or ""
+                  rel_path = rel_path or ""
+                  if keyword_hit(domain, rel_path):
+                      keyword_rows.append((file_id, domain, rel_path, flags))
+
+                  if flags != 1:
+                      continue
+                  payload = locate_payload(device_dir, file_id)
+                  if payload is None:
+                      continue
+
+                  bucket = safe_component(domain if domain else "Physical")
+                  target = logical / bucket / safe_rel_path(rel_path)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(payload, target)
+                  kept_rows.append({
+                      "fileID": file_id,
+                      "domain": domain,
+                      "relativePath": rel_path,
+                      "size": target.stat().st_size,
+                      "sha256": sha256_file(target),
+                      "logicalPath": str(target.relative_to(out_dir)).replace("\\", "/"),
+                  })
+
+              with (out_dir / "_manifest-kept.csv").open("w", newline="", encoding="utf-8-sig") as f:
+                  w = csv.DictWriter(f, fieldnames=["fileID", "domain", "relativePath", "size", "sha256", "logicalPath"])
+                  w.writeheader()
+                  w.writerows(kept_rows)
+
+              with (out_dir / "_manifest-keyword-hits.csv").open("w", newline="", encoding="utf-8-sig") as f:
+                  w = csv.writer(f)
+                  w.writerow(["fileID", "domain", "relativePath", "flags", "payloadCaptured"])
+                  kept_ids = {r["fileID"] for r in kept_rows}
+                  for file_id, domain, rel_path, flags in keyword_rows:
+                      w.writerow([file_id, domain, rel_path, flags, "YES" if file_id in kept_ids else "NO"])
+
+              meta = {
+                  "tool": "GoldenNugget PosterBoard Blur Probe",
+                  "readOnly": True,
+                  "label": label,
+                  "capturedAtLocal": datetime.now().isoformat(timespec="seconds"),
+                  "posterBoardIdentity": identity,
+                  "capturedPayloadCount": len(kept_rows),
+                  "keywordManifestRowCount": len(keyword_rows),
+              }
+              (out_dir / "_capture-meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+              return len(kept_rows), len(keyword_rows)
+
+
+          def zip_dir(src: Path, dest: Path):
+              with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+                  for p in sorted(src.rglob("*")):
+                      if p.is_file():
+                          z.write(p, p.relative_to(src))
+
+
+          async def choose_udid(requested: str | None) -> str:
+              devices = await usbmux.list_devices()
+              if requested:
+                  matches = [d for d in devices if d.serial == requested]
+                  if not matches:
+                      raise RuntimeError(f"Requested device is not connected: {requested}")
+                  return requested
+              if not devices:
+                  raise RuntimeError(
+                      "No iPhone/iPad detected. Unlock the device, trust this computer, and make sure Apple Devices or iTunes drivers are installed."
+                  )
+              if len(devices) > 1:
+                  print("More than one device is connected:")
+                  for d in devices:
+                      print("  ", d.serial)
+                  raise RuntimeError("Reconnect with only one device, or pass --udid <UDID>.")
+              return devices[0].serial
+
+
+          async def run_backup(udid: str, root: Path, filter_callback, title: str):
+              print(f"\n[{title}] Starting MobileBackup2 read-only backup...")
+              last_bucket = {-1}
+
+              def progress(v):
+                  try:
+                      n = int(float(v))
+                  except Exception:
+                      return
+                  bucket = n // 10
+                  if bucket not in last_bucket:
+                      last_bucket.clear()
+                      last_bucket.add(bucket)
+                      print(f"[{title}] {n}%")
+
+              async with lockdown_session(udid) as ld:
+                  async with Mobilebackup2Service(ld) as mb:
+                      if await mb.get_will_encrypt():
+                          raise RuntimeError(
+                              "iTunes/Finder backup encryption is enabled. This probe intentionally does not request or store your backup password. "
+                              "Temporarily disable local backup encryption, then run the probe again."
+                          )
+                      await mb.backup(
+                          full=True,
+                          backup_directory=root,
+                          progress_callback=progress,
+                          filter_callback=filter_callback,
+                      )
+              print(f"[{title}] Backup finished.")
+
+
+          async def capture(label: str, udid_arg: str | None, output_base: Path):
+              label = label.upper()
+              if label not in ("ON", "OFF", "ON2"):
+                  raise RuntimeError("Label must be ON, OFF, or ON2")
+
+              udid = await choose_udid(udid_arg)
+              print("Connected device detected.")
+              print("Mode: READ ONLY — no restore / no write / no respring")
+
+              work = Path(tempfile.mkdtemp(prefix="gn_blur_probe_"))
+              try:
+                  discovery_root = work / "discovery"
+                  streamed_db_names = []
+
+                  def keep_discovery(bf):
+                      name = bf.device_name or ""
+                      hit = PB_DB_NAME.lower() in name.lower()
+                      if hit:
+                          streamed_db_names.append(name)
+                      return hit
+
+                  await run_backup(udid, discovery_root, keep_discovery, "1/2 Discover PosterBoard")
+                  discovery_device = find_device_dir(discovery_root)
+                  identity = find_pb_identity(discovery_device / "Manifest.db")
+
+                  # Prefer the actual iOS 27 DeviceLink stream path when it exposes
+                  # Containers/... directly. This avoids relying only on Manifest.db
+                  # domain semantics, which can vary between iOS builds.
+                  for raw_name in streamed_db_names:
+                      tree = physical_tree_name(raw_name)
+                      if not tree.endswith(PB_DB_NAME):
+                          continue
+                      probe = "/" + tree
+                      marker = "/" + PB_STORE_MARKER
+                      idx = probe.lower().find(marker.lower())
+                      if idx >= 0 and "containers/" in probe[:idx].lower():
+                          identity["mode"] = "physical"
+                          identity["root"] = norm(probe[1:idx])
+                          identity["stream_db_device_name"] = raw_name
+                          break
+
+                  print("\nPosterBoard identity discovered:")
+                  print("  mode :", identity["mode"])
+                  print("  root :", identity["root"])
+                  print("  db   :", identity["db_relative_path"])
+
+                  capture_root = work / "capture"
+                  root_key = physical_tree_name(identity["root"])
+
+                  def keep_capture(bf):
+                      name = bf.device_name or ""
+                      n = norm(name)
+                      tree = physical_tree_name(name)
+
+                      if identity["mode"] == "domain":
+                          if n == PB_DOMAIN or n.startswith(PB_DOMAIN + "/"):
+                              return True
+                      else:
+                          if tree == root_key or tree.startswith(root_key + "/"):
+                              return True
+
+                      return is_aux_candidate(name)
+
+                  await run_backup(udid, capture_root, keep_capture, "2/2 Capture PosterBoard")
+                  capture_device = find_device_dir(capture_root)
+
+                  stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                  out_dir = output_base / f"PosterBoard-Blur-{label}-{stamp}"
+                  out_dir.mkdir(parents=True, exist_ok=False)
+                  count, kw_count = materialize_capture(capture_device, out_dir, identity, label)
+
+                  zip_path = output_base / f"PosterBoard-Blur-{label}-{stamp}.zip"
+                  zip_dir(out_dir, zip_path)
+                  shutil.rmtree(out_dir, ignore_errors=True)
+
+                  print("\n============================================================")
+                  print("CAPTURE COMPLETE")
+                  print("Label:", label)
+                  print("Captured payload files:", count)
+                  print("Manifest keyword rows:", kw_count)
+                  print("ZIP:", zip_path.resolve())
+                  print("============================================================")
+                  print("Upload this ZIP for ON/OFF comparison.")
+                  return 0
+              finally:
+                  shutil.rmtree(work, ignore_errors=True)
+
+
+          def main():
+              parser = argparse.ArgumentParser(
+                  description="Read-only iOS PosterBoard Blur ON/OFF probe based on GoldenNugget's MobileBackup2 path."
+              )
+              parser.add_argument("label", nargs="?", help="ON, OFF, or ON2")
+              parser.add_argument("--udid", default=None, help="Device UDID when more than one device is connected")
+              parser.add_argument("--output", default=".", help="Output directory (default: current directory)")
+              args = parser.parse_args()
+
+              label = args.label
+              if not label:
+                  label = input("Snapshot label [ON/OFF/ON2]: ").strip().upper()
+
+              try:
+                  return asyncio.run(capture(label, args.udid, Path(args.output).resolve()))
+              except KeyboardInterrupt:
+                  print("\nCancelled.")
+                  return 130
+              except Exception as e:
+                  print("\nERROR:", type(e).__name__ + ":", e)
+                  print("\nChecklist:")
+                  print("  1. Keep the iPhone unlocked and awake.")
+                  print("  2. Tap Trust if iOS asks to trust this computer.")
+                  print("  3. Install Apple Devices or Apple's iTunes USB drivers on Windows.")
+                  print("  4. Do not run another iTunes/Apple Devices backup at the same time.")
+                  return 1
+
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          '@ | Set-Content -Encoding UTF8 posterboard_blur_probe.py
+
+          python -m py_compile posterboard_blur_probe.py
+          Write-Host "Probe syntax check passed."
+
+      - name: Build Windows probe
+        shell: pwsh
+        run: |
+          python -m PyInstaller posterboard_blur_probe.py `
+            --name PosterBoardBlurProbe `
+            --onedir `
+            --console `
+            --noconfirm `
+            --clean `
+            --collect-all pymobiledevice3 `
+            --hidden-import pymobiledevice3.services.mobilebackup2 `
+            --hidden-import pymobiledevice3.services.device_link
+
+          if (!(Test-Path "dist/PosterBoardBlurProbe/PosterBoardBlurProbe.exe")) {
+            throw "PosterBoardBlurProbe.exe was not created"
+          }
+
+      - name: Package Windows ZIP
+        shell: pwsh
+        run: |
+          $zip = "PosterBoardBlurProbe-Windows.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path "dist/PosterBoardBlurProbe/*" -DestinationPath $zip -CompressionLevel Optimal
+          Get-FileHash $zip -Algorithm SHA256 | Format-List
+
+      - name: Upload Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PosterBoardBlurProbe-Windows
+          path: PosterBoardBlurProbe-Windows.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "posterboard-blur-probe-${{ github.run_number }}"
+          gh release create $tag "PosterBoardBlurProbe-Windows.zip" `
+            --title "PosterBoard Blur Probe ${{ github.run_number }}" `
+            --notes "Read-only GoldenNugget-based PosterBoard Blur ON/OFF capture tool. No restore, no device writes. Run once with Blur ON and once with Blur OFF, then compare/upload the two ZIPs."
