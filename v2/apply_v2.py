@@ -200,6 +200,6 @@ src_icon.unlink()
 assert 'PosterLabSafety.preflight(' in read('TendiesEngine.swift')
 assert 'if resetProtections {' in read('TendiesEngine.swift')
 assert 'reportURL = try PosterLabSafety.exportReport' in read('TendiesView.swift')
-assert '自动 NeoSpring' not in read('AppViewModel.swift')[read('AppViewModel.swift').index('func flashSelectedTendies() async'):]
+assert 'DispatchQueue.main.asyncAfter' not in read('AppViewModel.swift')[read('AppViewModel.swift').index('func flashSelectedTendies() async'):read('AppViewModel.swift').index('func respringDevice()')]
 assert (icon_dir / 'AppIcon.png').stat().st_size > 10000
 print('PosterLab v2 overlay applied: graphics, safety checks, manual evidence reports')
