@@ -1,0 +1,91 @@
+name: PosterLab v2 — Build Unsigned IPA
+
+on:
+  push:
+    branches: [posterlab-app-v2]
+    paths:
+      - v2/**
+      - .github/workflows/posterlab-v2-build.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout PosterLab v2 overlay
+        uses: actions/checkout@v4
+        with:
+          path: overlay
+          persist-credentials: false
+
+      - name: Checkout authorized AirLift source
+        uses: actions/checkout@v4
+        with:
+          repository: qmkklplo/AirCard-iOS
+          ref: main
+          path: engine
+          persist-credentials: false
+
+      - name: Apply new icon and v2 safety/diagnostic features
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 overlay/v2/apply_v2.py engine overlay
+          plutil -lint engine/ios-app/Info.plist
+          plutil -lint engine/AirCard-iOS.xcodeproj/project.pbxproj
+
+      - name: Validate app sources and icon
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          t=Path("engine/ios-app/TendiesEngine.swift").read_text()
+          s=Path("engine/ios-app/PosterLabSafety.swift").read_text()
+          v=Path("engine/ios-app/TendiesView.swift").read_text()
+          assert "PosterLabSafety.preflight(" in t
+          assert "preservesMercuryDescriptorUUID" in t
+          assert "if resetProtections {" in t
+          assert "remoteReadbackVerified" in s
+          assert "galleryCheck" in v and "blurCheck" in v
+          img=Path("engine/ios-app/Assets.xcassets/AppIcon.appiconset/AppIcon.png")
+          assert img.stat().st_size > 10000
+          subprocess.run(["sips", "-g", "pixelWidth", "-g", "pixelHeight", str(img)], check=True)
+          print("PosterLab v2 source and icon checks passed")
+          PY
+
+      - name: Compile for iPhone
+        shell: bash
+        working-directory: engine
+        run: |
+          set -euo pipefail
+          xcodebuild -project AirCard-iOS.xcodeproj \
+            -scheme AirCard-iOS -configuration Release -sdk iphoneos \
+            -derivedDataPath "$RUNNER_TEMP/PosterLabV2" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" PRODUCT_BUNDLE_IDENTIFIER=dev.posterlab.wallpaper \
+            MARKETING_VERSION=2.0 CURRENT_PROJECT_VERSION=200 \
+            build 2>&1 | tee "$RUNNER_TEMP/posterlab-v2-build.log"
+          test -d "$RUNNER_TEMP/PosterLabV2/Build/Products/Release-iphoneos/AirCard-iOS.app"
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$RUNNER_TEMP/PosterLabV2/Build/Products/Release-iphoneos/AirCard-iOS.app" \
+            "$RUNNER_TEMP/ipa/Payload/PosterLab.app"
+          (cd "$RUNNER_TEMP/ipa" && zip -q -r "$GITHUB_WORKSPACE/PosterLab-v2-alpha-unsigned.ipa" Payload)
+          test -s PosterLab-v2-alpha-unsigned.ipa
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: PosterLab-v2-alpha-unsigned-IPA
+          path: PosterLab-v2-alpha-unsigned.ipa
+          retention-days: 30
