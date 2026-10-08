@@ -1,0 +1,86 @@
+name: PosterLab v2.1 — Build Unsigned IPA
+on:
+  push:
+    branches: [posterlab-app-v2-1]
+    paths:
+      - v2/**
+      - .github/workflows/posterlab-v21-build.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout PosterLab overlay
+        uses: actions/checkout@v4
+        with:
+          path: overlay
+          persist-credentials: false
+      - name: Checkout trusted AirLift source
+        uses: actions/checkout@v4
+        with:
+          repository: qmkklplo/AirCard-iOS
+          ref: main
+          path: engine
+          persist-credentials: false
+      - name: Integrate v2 and v2.1 patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile overlay/v2/apply_v2.py overlay/v2/apply_v21.py
+          python3 overlay/v2/apply_v2.py engine overlay
+          python3 overlay/v2/apply_v21.py engine overlay
+          plutil -lint engine/AirCard-iOS.xcodeproj/project.pbxproj
+          plutil -lint engine/ios-app/Info.plist
+      - name: Validate safety integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          engine=Path("engine/ios-app/TendiesEngine.swift").read_text()
+          viewmodel=Path("engine/ios-app/AppViewModel.swift").read_text()
+          view=Path("engine/ios-app/TendiesView.swift").read_text()
+          project=Path("engine/AirCard-iOS.xcodeproj/project.pbxproj").read_text()
+          assert engine.count("PosterLabIntegrity.validateArchive(") == 2
+          assert "try PosterLabDescriptor.prepare(" in engine
+          assert "PosterLabIntegrity.stagingChecksum" in engine
+          assert 'resetPBProtections: Bool = false' in viewmodel
+          assert "PosterLabSafety.preflight(" in engine
+          assert "没有自动回滚" in viewmodel
+          assert "没有设备端原始文件备份" in view
+          for name in ["PosterLabSafety.swift","PosterLabIntegrity.swift","PosterLabDescriptor.swift"]:
+              assert Path("engine/ios-app",name).exists()
+              assert project.count(f"/* {name} in Sources */") >= 2
+          print("PosterLab v2.1 safety integration: OK")
+          PY
+      - name: Compile iOS app
+        shell: bash
+        working-directory: engine
+        run: |
+          set -euo pipefail
+          xcodebuild -project AirCard-iOS.xcodeproj \
+            -scheme AirCard-iOS -configuration Release -sdk iphoneos \
+            -derivedDataPath "$RUNNER_TEMP/PosterLabV21" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" PRODUCT_BUNDLE_IDENTIFIER=dev.posterlab.wallpaper \
+            MARKETING_VERSION=2.1 CURRENT_PROJECT_VERSION=210 \
+            build 2>&1 | tee "$RUNNER_TEMP/posterlab-v21-build.log"
+      - name: Package IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/PosterLabV21/Build/Products/Release-iphoneos/AirCard-iOS.app"
+          test -d "$app"
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$app" "$RUNNER_TEMP/ipa/Payload/PosterLab.app"
+          (cd "$RUNNER_TEMP/ipa" && zip -q -r "$GITHUB_WORKSPACE/PosterLab-v2.1-unsigned.ipa" Payload)
+          test -s PosterLab-v2.1-unsigned.ipa
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: PosterLab-v2.1-unsigned-IPA
+          path: PosterLab-v2.1-unsigned.ipa
+          retention-days: 30
