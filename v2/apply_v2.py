@@ -40,6 +40,42 @@ save("ContentView.swift", s)
 
 s = read("TendiesEngine.swift")
 s = once(s, "import Foundation\n", "import Foundation\nimport CryptoKit\n", "Engine Foundation import")
+# For safety, prohibit multi-package transactions until true device backup and
+# rollback are available. AirLift's current FFI provides no remote read/delete.
+s = once(
+    s,
+    '''        guard !items.isEmpty else {
+            log("⚠️ No wallpapers selected to flash")
+            return
+        }
+''',
+    '''        guard !items.isEmpty else {
+            throw NSError(domain: "PosterLab", code: 100,
+                userInfo: [NSLocalizedDescriptionKey: "没有选择壁纸包"])
+        }
+        guard items.count == 1 else {
+            throw NSError(domain: "PosterLab", code: 101,
+                userInfo: [NSLocalizedDescriptionKey: "v2 安全模式每次只能刷入一个壁纸包；请逐个刷入并记录结果。"])
+        }
+''',
+    "single package safety gate"
+)
+s = once(
+    s,
+    '''            guard extractRC == 0 else {
+                log("❌ Failed to extract '\(item.name)'")
+                continue
+            }
+''',
+    '''            guard extractRC == 0 else {
+                log("壁纸包解压失败，已经取消安装；不会虚报刷入成功。")
+                throw NSError(domain: "PosterLab", code: 102,
+                    userInfo: [NSLocalizedDescriptionKey: "壁纸包解压失败，请检查 .tendies 文件完整性。"])
+            }
+''',
+    "archive extract failure"
+)
+
 # Enforce safe package staging before any write; hashes are LOCAL baseline only.
 marker = '            log("  ✨ Found \\(descriptors.count) descriptor(s) to install")'
 if marker not in s: raise SystemExit("Missing descriptor enumeration")
