@@ -1,0 +1,157 @@
+name: PosterLab v1 — Build Unsigned IPA
+
+on:
+  push:
+    branches:
+      - posterlab-app-v1
+    paths:
+      - .github/workflows/posterlab-build.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout device engine (user-maintained AirCard fork)
+        uses: actions/checkout@v4
+        with:
+          repository: qmkklplo/AirCard-iOS
+          ref: main
+          persist-credentials: false
+
+      - name: Create PosterLab wallpaper-only app
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          content = Path("ios-app/ContentView.swift")
+          s = content.read_text()
+          start = s.index('        TabView(selection: $vm.selectedTab) {', s.index('struct ContentView: View {'))
+          end = s.index('        .alert("Notice"', start)
+          s = s[:start] + '''        TabView(selection: $vm.selectedTab) {
+                      PairingTab()
+                          .tabItem { Label("设备连接", systemImage: "antenna.radiowaves.left.and.right") }
+                          .tag(AppTab.pairing)
+
+                      TendiesView()
+                          .tabItem { Label("壁纸实验室", systemImage: "photo.stack.fill") }
+                          .tag(AppTab.wallpapers)
+                  }
+          ''' + s[end:]
+          s = s.replace('Text("AirCard-iOS")', 'Text("PosterLab")', 1)
+          content.write_text(s)
+
+          view = Path("ios-app/TendiesView.swift")
+          s = view.read_text()
+          anchor = '            Form {\n'
+          if anchor not in s: raise SystemExit("TendiesView Form marker missing")
+          intro = '''                Section {
+                      Label("PosterLab · 壁纸实验室", systemImage: "sparkles.rectangle.stack")
+                          .font(.headline)
+                      Text("LocalDevVPN + AirLift · 针对 iOS 18 原生壁纸在新系统上的兼容性研究")
+                          .font(.caption)
+                          .foregroundStyle(.secondary)
+                      Text("成功传输 ≠ 系统图库已注册 ≠ 主屏幕模糊随时间更新。Celosia 的系统层快照刷新问题尚待验证。")
+                          .font(.caption)
+                          .foregroundStyle(.orange)
+                  }
+          '''
+          s = s.replace(anchor, anchor + intro, 1)
+          for a,b in {
+            'Choose .tendies from Files…':'导入 .tendies 壁纸包',
+            'Import More Wallpapers…':'继续导入壁纸',
+            'Force PosterBoard Cache Refresh':'尝试刷新 PosterBoard 偏好',
+            'Resets file protections so iOS re-indexes wallpapers immediately':'实验性操作：不能保证系统图库重新索引',
+            'No .tendies wallpapers loaded yet':'暂未导入壁纸包',
+            'Flashing Wallpapers…':'正在传输壁纸文件…',
+            'Flashing will automatically trigger NeoSpring to respring the device and apply your new wallpapers.':'刷入后保留完整日志；需要时可手动 NeoSpring。图库与动态模糊必须分别验证。',
+            'Wallpapers Gallery':'壁纸包列表',
+            'Flash Log (':'操作日志 (',
+            '.navigationTitle("Wallpapers")':'.navigationTitle("PosterLab")'
+          }.items():
+              s = s.replace(a,b)
+          view.write_text(s)
+
+          vm = Path("ios-app/AppViewModel.swift")
+          s = vm.read_text()
+          start = s.index('            tendiesFlashLog.append("🎉 Wallpapers applied successfully!")', s.index('func flashSelectedTendies() async'))
+          end = s.index('        } catch {', start)
+          s = s[:start] + '''            tendiesFlashLog.append("文件传输流程结束；请手动确认壁纸是否显示在系统图库。")
+                      tendiesFlashLog.append("Celosia 动态模糊刷新尚未验证；不自动 NeoSpring。")
+          ''' + s[end:]
+          vm.write_text(s)
+
+          engine = Path("ios-app/TendiesEngine.swift")
+          s = engine.read_text()
+          if 'preserveSemanticIdentifiers: preservesSemanticIdentifiers' not in s:
+              raise SystemExit("Mercury semantic identifier protection missing in source")
+          anchor = '        // Always force PosterBoard cache refresh and file protections reset'
+          start = s.index(anchor, s.index('public func flashTendies('))
+          end = s.index('        progress(1.0)', start)
+          s = s[:start] + '        if resetProtections {\n' + s[start:end] + '''        } else {
+                      log("PosterBoard preference refresh was skipped by user choice")
+                  }
+
+          ''' + s[end:]
+          s = s.replace('log("\\n🎉 All wallpapers injected successfully! Open Lock Screen settings or long-press lockscreen to choose your new wallpaper.")',
+                         'log("\\n传输接口已返回成功；图库可见性与动态模糊刷新仍需手动验证。")')
+          engine.write_text(s)
+
+          plist = Path("ios-app/Info.plist")
+          s = plist.read_text().replace('<string>AirCard-iOS</string>', '<string>PosterLab</string>', 1)
+          s = s.replace('AirCard-iOS advertises', 'PosterLab advertises')
+          plist.write_text(s)
+          print("PosterLab UI integration and safety markers: OK")
+          PY
+
+      - name: Validate patched Swift and Info.plist
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          v=Path("ios-app/AppViewModel.swift").read_text()
+          assert 'tendiesFlashLog.append("Celosia 动态模糊刷新尚未验证' in v
+          e=Path("ios-app/TendiesEngine.swift").read_text()
+          assert 'if resetProtections {' in e
+          assert 'preserveSemanticIdentifiers: preservesSemanticIdentifiers' in e
+          c=Path("ios-app/ContentView.swift").read_text()
+          assert 'Label("壁纸实验室"' in c
+          assert '.tabItem { Label("Wallet Cards"' not in c[c.index('struct ContentView: View'):c.index('// MARK: - Pairing Tab')]
+          PY
+          plutil -lint ios-app/Info.plist
+
+      - name: Build device app without signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -project AirCard-iOS.xcodeproj \
+            -scheme AirCard-iOS -configuration Release -sdk iphoneos \
+            -derivedDataPath "$RUNNER_TEMP/PosterLabBuild" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" PRODUCT_BUNDLE_IDENTIFIER=dev.posterlab.wallpaper \
+            build 2>&1 | tee "$RUNNER_TEMP/build.log"
+          test -d "$RUNNER_TEMP/PosterLabBuild/Build/Products/Release-iphoneos/AirCard-iOS.app"
+
+      - name: Package PosterLab unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$RUNNER_TEMP/PosterLabBuild/Build/Products/Release-iphoneos/AirCard-iOS.app" \
+            "$RUNNER_TEMP/ipa/Payload/PosterLab.app"
+          (cd "$RUNNER_TEMP/ipa" && zip -q -r "$GITHUB_WORKSPACE/PosterLab-v1-unsigned.ipa" Payload)
+          test -s PosterLab-v1-unsigned.ipa
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: PosterLab-v1-unsigned-IPA
+          path: PosterLab-v1-unsigned.ipa
+          retention-days: 30
