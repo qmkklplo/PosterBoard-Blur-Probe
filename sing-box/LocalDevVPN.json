@@ -1,0 +1,18 @@
+{
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": ["172.19.0.1/30"],
+      "auto_route": true,
+      "loopback_address": ["10.7.0.1"],
+      "route_address": ["10.7.0.1/32"]
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
