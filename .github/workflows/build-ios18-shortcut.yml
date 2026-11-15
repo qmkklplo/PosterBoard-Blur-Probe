@@ -1,0 +1,44 @@
+name: Build iOS 18 Smart Wallpaper Shortcut
+on:
+  push:
+    branches: [ios18-smart-wallpaper-20261115]
+    paths:
+      - 'shortcut-builder/**'
+      - '.github/workflows/build-ios18-shortcut.yml'
+  workflow_dispatch:
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate Shortcut
+        run: |
+          python3 shortcut-builder/generate.py
+          python3 - <<'PY'
+          from pathlib import Path
+          import plistlib
+          p=Path('dist/iOS18_Smart_Wallpaper_SunsetMinus1h.shortcut')
+          d=plistlib.loads(p.read_bytes())
+          ids=[a['WFWorkflowActionIdentifier'] for a in d['WFWorkflowActions']]
+          assert ids.count('is.workflow.actions.posters.switch')==6
+          assert ids.count('is.workflow.actions.adjustdate')==2
+          assert len(d['WFWorkflowImportQuestions'])==5
+          for a in d['WFWorkflowActions']:
+              if a['WFWorkflowActionIdentifier']=='is.workflow.actions.adjustdate':
+                  q=a['WFWorkflowActionParameters']
+                  assert q['WFDuration']['Value']['Magnitude']==1
+                  assert q['WFAdjustOperation']=='Subtract'
+          print('Shortcut structure validated',p.stat().st_size)
+          PY
+      - name: Commit importable files to source branch
+        run: |
+          set -e
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add dist/iOS18_Smart_Wallpaper_SunsetMinus1h.shortcut dist/iOS18_Smart_Wallpaper_SunsetMinus1h.plist
+          if ! git diff --cached --quiet; then
+            git commit -m 'Publish iOS18 smart wallpaper shortcut export'
+            git push origin HEAD:ios18-smart-wallpaper-20261115
+          fi
